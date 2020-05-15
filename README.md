@@ -2,10 +2,11 @@
 
 Dynamic implementation of Alembic and SQLAlchemy
 
-# Create new revision
+### Create new revision
 run the following from the moonshine lib folder
- alembic revision -m "create user table"
- 
+```console
+alembic revision -m "create user table"
+```
 
 ### Credits
 
