@@ -12,6 +12,11 @@ from contextlib import contextmanager
 
 
 class Moonshine:
+    """
+    Only (Online) upgrade, downgrade and stamp use env.py
+    Offline removed to return the sql instead of stdout
+    """
+
     __config = None
     __engine = None
     __script_directory = None
@@ -75,9 +80,7 @@ class Moonshine:
         script_location = os.path.join(current_dir_path, "migrations")
         version_locations = [script_location]
         self.__config.set_main_option("script_location", script_location)
-        self.__config.set_main_option(
-            "version_locations", ",".join(version_locations)
-        )
+        self.__config.set_main_option("version_locations", ",".join(version_locations))
         return self.__config
 
     @property
@@ -115,27 +118,6 @@ class Moonshine:
             env.configure(connection=conn)
             yield env.get_context()
 
-    def run_migrations(self, fn, **kwargs):
-        """Configure an Alembic :class:`~alembic.runtime.migration.MigrationContext` to run migrations for the given function.
-
-        This takes the place of Alembic's env.py file, specifically the ``run_migrations_online`` function.
-
-        :param fn: use this function to control what migrations are run
-        :param kwargs: extra arguments passed to ``upgrade`` or ``downgrade`` in each revision
-        """
-
-        env = self.environment_context
-
-        with self.engine.connect() as connection:
-            env.configure(
-                connection=connection,
-                fn=fn,
-                target_metadata=self.target_metadata,
-            )
-
-            with env.begin_transaction():
-                env.run_migrations(**kwargs)
-
     @property
     def current(self):
         """Get the list of current revisions."""
@@ -153,9 +135,7 @@ class Moonshine:
         if resolve_dependencies:
             return self.script_directory.get_revisions("heads")
 
-        return self.script_directory.get_revisions(
-            self.script_directory.get_heads()
-        )
+        return self.script_directory.get_revisions(self.script_directory.get_heads())
 
     def branches(self):
         """Get the list of revisions that have more than one next revision."""
@@ -166,9 +146,7 @@ class Moonshine:
             if revision.is_branch_point
         ]
 
-    def history(
-        self, rev_range="base:heads", verbose=False, indicate_current=False
-    ):
+    def history(self, rev_range="base:heads", verbose=False, indicate_current=False):
         """List changeset scripts in chronological order.
 
         :param config: a :class:`.Config` instance.
@@ -186,8 +164,7 @@ class Moonshine:
         if rev_range is not None:
             if ":" not in rev_range:
                 raise util.CommandError(
-                    "History range requires [start]:[end], "
-                    "[start]:, or :[end]"
+                    "History range requires [start]:[end], " "[start]:, or :[end]"
                 )
             base, head = rev_range.strip().split(":")
         else:
@@ -228,56 +205,149 @@ class Moonshine:
         else:
             return _display_history(base, head)
 
-    def stamp(self, target="heads"):
-        """Set the current database revision without running migrations.
+    def stamp(self, revision, sql=False, tag=None, purge=False):
+        """'stamp' the revision table with the given revision; don't
+        run any migrations.
 
-        :param target: revision to set to, default 'heads'
+        :param revision: target revision or list of revisions.   May be a list
+        to indicate stamping of multiple branch heads.
+
+        .. note:: this parameter is called "revisions" in the command line
+            interface.
+
+        .. versionchanged:: 1.2  The revision may be a single revision or
+            list of revisions when stamping multiple branch heads.
+
+        :param sql: use ``--sql`` mode
+
+        :param tag: an arbitrary "tag" that can be intercepted by custom
+        ``env.py`` scripts via the :class:`.EnvironmentContext.get_tag_argument`
+        method.
+
+        :param purge: delete all entries in the version table before stamping.
+
+        .. versionadded:: 1.2
+
         """
+        config = self.config
+        script = self.script_directory
+        config.attributes["engine"] = self.engine
 
-        target = (
-            "heads" if target is None else getattr(target, "revision", target)
-        )
+        if sql:
+            destination_revs = []
+            starting_rev = None
+            for _revision in util.to_list(revision):
+                if ":" in _revision:
+                    srev, _revision = _revision.split(":", 2)
 
-        def do_stamp(revision, context):
-            return self.script_directory._stamp_revs(target, revision)
-
-        self.run_migrations(do_stamp)
-
-    def upgrade(self, revision="heads"):
-        """Run migrations to upgrade database.
-
-        :param target: revision to go to, default 'heads'
-        """
-
-        revision = (
-            "heads"
-            if revision is None
-            else getattr(revision, "revision", revision)
-        )
-        revision = str(revision)
-
-        def do_upgrade(rev, context):
-            return self.script_directory._upgrade_revs(revision, rev)
-
-        self.run_migrations(do_upgrade)
-
-    def downgrade(self, revision=-1):
-        """Run migrations to downgrade database.
-
-        :param target: revision to go down to, default -1
-        """
-
-        try:
-            revision = int(revision)
-        except ValueError:
-            revision = getattr(revision, "revision", revision)
+                    if starting_rev != srev:
+                        if starting_rev is None:
+                            starting_rev = srev
+                        else:
+                            raise util.CommandError(
+                                "Stamp operation with --sql only supports a "
+                                "single starting revision at a time"
+                            )
+                destination_revs.append(_revision)
         else:
-            if revision > 0:
-                revision = -revision
+            destination_revs = util.to_list(revision)
 
-        revision = str(revision)
+        def do_stamp(rev, context):
+            return script._stamp_revs(util.to_tuple(destination_revs), rev)
 
-        def do_downgrade(rev, context):
-            return self.script_directory._downgrade_revs(revision, rev)
+        if not sql:
+            # Offline mode
+            pass
+        else:
+            with EnvironmentContext(
+                config,
+                script,
+                fn=do_stamp,
+                starting_rev=starting_rev if sql else None,
+                destination_rev=util.to_tuple(destination_revs),
+                tag=tag,
+                purge=purge,
+            ):
+                script.run_env()
 
-        self.run_migrations(do_downgrade)
+    def upgrade(self, revision, sql=False, tag=None):
+        """Upgrade to a later version.
+
+        :param revision: string revision target or range for --sql mode
+
+        :param sql: if True, use ``--sql`` mode
+
+        :param tag: an arbitrary "tag" that can be intercepted by custom
+        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
+        method.
+
+        """
+        config = self.config
+        script = self.script_directory
+        config.attributes["engine"] = self.engine
+        config.attributes["target_metadata"] = self.target_metadata
+
+        starting_rev = None
+        if ":" in revision:
+            if not sql:
+                raise util.CommandError("Range revision not allowed")
+            starting_rev, revision = revision.split(":", 2)
+
+        def upgrade(rev, context):
+            return script._upgrade_revs(revision, rev)
+
+        if not sql:
+            # offline mode
+            pass
+        else:
+            with EnvironmentContext(
+                config,
+                script,
+                fn=upgrade,
+                starting_rev=starting_rev,
+                destination_rev=revision,
+                tag=tag,
+            ):
+                script.run_env()
+
+    def downgrade(self, revision, sql=False, tag=None):
+        """Revert to a previous version.
+
+        :param revision: string revision target or range for --sql mode
+
+        :param sql: if True, use ``--sql`` mode
+
+        :param tag: an arbitrary "tag" that can be intercepted by custom
+        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
+        method.
+
+        """
+
+        config = self.config
+        script = self.script_directory
+        config.attributes["engine"] = self.engine
+
+        starting_rev = None
+        if ":" in revision:
+            if not sql:
+                raise util.CommandError("Range revision not allowed")
+            starting_rev, revision = revision.split(":", 2)
+        elif sql:
+            raise util.CommandError("downgrade with --sql requires <fromrev>:<torev>")
+
+        def downgrade(rev, context):
+            return script._downgrade_revs(revision, rev)
+
+        if not sql:
+            # offline mode
+            pass
+        else:
+            with EnvironmentContext(
+                config,
+                script,
+                fn=downgrade,
+                starting_rev=starting_rev,
+                destination_rev=revision,
+                tag=tag,
+            ):
+                script.run_env()
