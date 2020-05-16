@@ -7,7 +7,7 @@ from alembic.config import Config
 from alembic import util
 from sqlalchemy import engine_from_config, create_engine, MetaData
 from sqlalchemy.engine import Engine
-import os, sys
+import os, sys, io
 from contextlib import contextmanager
 
 
@@ -15,6 +15,13 @@ class Moonshine:
     """
     Only (Online) upgrade, downgrade and stamp use env.py
     Offline removed to return the sql instead of stdout
+
+    Commands not implemented, use alembic cli:
+        list_templates
+        init
+        revision
+        merge
+        edit
     """
 
     __config = None
@@ -73,23 +80,24 @@ class Moonshine:
     def config(self) -> Config:
         if isinstance(self.__config, Config):
             return self.__config
-
         self.__config = Config()
         # set defaults for script_location and version_locations
         current_dir_path = os.path.dirname(os.path.realpath(__file__))
-        script_location = os.path.join(current_dir_path, "migrations")
-        version_locations = [script_location]
+        # script_location is where env.py lives
+        script_location = os.path.join(current_dir_path, "script")
+        # version_locations are where the migrations live
+        version_location = os.path.join(current_dir_path, "migrations")
+        version_locations = [version_location]
         self.__config.set_main_option("script_location", script_location)
-        self.__config.set_main_option("version_locations", ",".join(version_locations))
+        self.__config.set_main_option(
+            "version_locations", ",".join(version_locations)
+        )
         return self.__config
 
     @property
     def script_directory(self) -> ScriptDirectory:
         if isinstance(self.__script_directory, ScriptDirectory):
             return self.__script_directory
-        logger.debug(
-            f"config script_location:{self.config.get_main_option('script_location')}"
-        )
         self.__script_directory = ScriptDirectory.from_config(self.config)
         return self.__script_directory
 
@@ -97,7 +105,6 @@ class Moonshine:
     def engine(self):
         if isinstance(self.__engine, Engine):
             return self.__engine
-
         self.__engine = create_engine()
         return self.__engine
 
@@ -118,38 +125,110 @@ class Moonshine:
             env.configure(connection=conn)
             yield env.get_context()
 
-    @property
-    def current(self):
-        """Get the list of current revisions."""
-        with self.migration_context as migration_context:
-            return self.script_directory.get_revisions(
-                migration_context.get_current_heads()
+    def upgrade(self, revision, sql=False, tag=None):
+        """Upgrade to a later version.
+
+        :param revision: string revision target or range for --sql mode
+
+        :param sql: if True, use ``--sql`` mode
+
+        :param tag: an arbitrary "tag" that can be intercepted by custom
+        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
+        method.
+
+        """
+        config = self.config
+        script = self.script_directory
+        config.attributes["engine"] = self.engine
+        config.attributes["target_metadata"] = self.target_metadata
+
+        output_buffer = io.StringIO()
+        config.attributes["output_buffer"] = output_buffer
+
+        starting_rev = None
+        if ":" in revision:
+            if not sql:
+                raise util.CommandError("Range revision not allowed")
+            starting_rev, revision = revision.split(":", 2)
+
+        def do_upgrade(rev, context):
+            logger.debug(
+                f"moonshine:upgrade:do_upgrade:rev:{rev}:revision:{revision}"
             )
+            return script._upgrade_revs(revision, rev)
 
-    def heads(self, resolve_dependencies=False):
-        """Get the list of revisions that have no child revisions.
+        with EnvironmentContext(
+            config,
+            script,
+            fn=do_upgrade,
+            as_sql=sql,
+            starting_rev=starting_rev,
+            destination_rev=revision,
+            tag=tag,
+        ):
+            script.run_env()
+            output_buffer.seek(0)
+            return output_buffer.read()
 
-        :param resolve_dependencies: treat dependencies as down revisions
+    def downgrade(self, revision, sql=False, tag=None):
+        """Revert to a previous version.
+
+        :param revision: string revision target or range for --sql mode
+
+        :param sql: if True, use ``--sql`` mode
+
+        :param tag: an arbitrary "tag" that can be intercepted by custom
+        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
+        method.
+
         """
 
-        if resolve_dependencies:
-            return self.script_directory.get_revisions("heads")
+        config = self.config
+        script = self.script_directory
+        config.attributes["engine"] = self.engine
 
-        return self.script_directory.get_revisions(self.script_directory.get_heads())
+        output_buffer = io.StringIO()
+        config.attributes["output_buffer"] = output_buffer
 
-    def branches(self):
-        """Get the list of revisions that have more than one next revision."""
+        starting_rev = None
+        if ":" in revision:
+            if not sql:
+                raise util.CommandError("Range revision not allowed")
+            starting_rev, revision = revision.split(":", 2)
+        elif sql:
+            raise util.CommandError(
+                "downgrade with --sql requires <fromrev>:<torev>"
+            )
 
-        return [
-            revision
-            for revision in self.script_directory.walk_revisions()
-            if revision.is_branch_point
-        ]
+        def do_downgrade(rev, context):
+            return script._downgrade_revs(revision, rev)
 
-    def history(self, rev_range="base:heads", verbose=False, indicate_current=False):
+        with EnvironmentContext(
+            config,
+            script,
+            fn=do_downgrade,
+            as_sql=sql,
+            starting_rev=starting_rev,
+            destination_rev=revision,
+            tag=tag,
+        ):
+            script.run_env()
+            output_buffer.seek(0)
+            return output_buffer.read()
+
+    def show(self, revision):
+        """Show the revision(s) denoted by the given symbol.
+       
+        :param revision: string revision target
+
+        """
+        script = self.script_directory
+        return script.get_revisions(revision)
+
+    def history(
+        self, rev_range="base:heads", verbose=False, indicate_current=False
+    ):
         """List changeset scripts in chronological order.
-
-        :param config: a :class:`.Config` instance.
 
         :param rev_range: string revision range
 
@@ -164,7 +243,8 @@ class Moonshine:
         if rev_range is not None:
             if ":" not in rev_range:
                 raise util.CommandError(
-                    "History range requires [start]:[end], " "[start]:, or :[end]"
+                    "History range requires [start]:[end], "
+                    "[start]:, or :[end]"
                 )
             base, head = rev_range.strip().split(":")
         else:
@@ -205,6 +285,37 @@ class Moonshine:
         else:
             return _display_history(base, head)
 
+    def heads(self, resolve_dependencies=False):
+        """Show current available heads in the script directory.
+
+        :param resolve_dependencies: treat dependency version as down revisions.
+        """
+
+        if resolve_dependencies:
+            return self.script_directory.get_revisions("heads")
+
+        return self.script_directory.get_revisions(
+            self.script_directory.get_heads()
+        )
+
+    @property
+    def branches(self):
+        """Show current branch points."""
+        script = self.script_directory
+        branches = list()
+        for sc in script.walk_revisions():
+            if sc.is_branch_point:
+                branches.append(sc)
+        return branches
+
+    @property
+    def current(self):
+        """Display the current revision for a database."""
+        with self.migration_context as migration_context:
+            return self.script_directory.get_revisions(
+                migration_context.get_current_heads()
+            )
+
     def stamp(self, revision, sql=False, tag=None, purge=False):
         """'stamp' the revision table with the given revision; don't
         run any migrations.
@@ -229,13 +340,17 @@ class Moonshine:
         .. versionadded:: 1.2
 
         """
+
         config = self.config
         script = self.script_directory
         config.attributes["engine"] = self.engine
 
+        output_buffer = io.StringIO()
+        config.attributes["output_buffer"] = output_buffer
+
+        starting_rev = None
         if sql:
             destination_revs = []
-            starting_rev = None
             for _revision in util.to_list(revision):
                 if ":" in _revision:
                     srev, _revision = _revision.split(":", 2)
@@ -255,99 +370,16 @@ class Moonshine:
         def do_stamp(rev, context):
             return script._stamp_revs(util.to_tuple(destination_revs), rev)
 
-        if not sql:
-            # Offline mode
-            pass
-        else:
-            with EnvironmentContext(
-                config,
-                script,
-                fn=do_stamp,
-                starting_rev=starting_rev if sql else None,
-                destination_rev=util.to_tuple(destination_revs),
-                tag=tag,
-                purge=purge,
-            ):
-                script.run_env()
-
-    def upgrade(self, revision, sql=False, tag=None):
-        """Upgrade to a later version.
-
-        :param revision: string revision target or range for --sql mode
-
-        :param sql: if True, use ``--sql`` mode
-
-        :param tag: an arbitrary "tag" that can be intercepted by custom
-        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
-        method.
-
-        """
-        config = self.config
-        script = self.script_directory
-        config.attributes["engine"] = self.engine
-        config.attributes["target_metadata"] = self.target_metadata
-
-        starting_rev = None
-        if ":" in revision:
-            if not sql:
-                raise util.CommandError("Range revision not allowed")
-            starting_rev, revision = revision.split(":", 2)
-
-        def upgrade(rev, context):
-            return script._upgrade_revs(revision, rev)
-
-        if not sql:
-            # offline mode
-            pass
-        else:
-            with EnvironmentContext(
-                config,
-                script,
-                fn=upgrade,
-                starting_rev=starting_rev,
-                destination_rev=revision,
-                tag=tag,
-            ):
-                script.run_env()
-
-    def downgrade(self, revision, sql=False, tag=None):
-        """Revert to a previous version.
-
-        :param revision: string revision target or range for --sql mode
-
-        :param sql: if True, use ``--sql`` mode
-
-        :param tag: an arbitrary "tag" that can be intercepted by custom
-        ``env.py`` scripts via the :meth:`.EnvironmentContext.get_tag_argument`
-        method.
-
-        """
-
-        config = self.config
-        script = self.script_directory
-        config.attributes["engine"] = self.engine
-
-        starting_rev = None
-        if ":" in revision:
-            if not sql:
-                raise util.CommandError("Range revision not allowed")
-            starting_rev, revision = revision.split(":", 2)
-        elif sql:
-            raise util.CommandError("downgrade with --sql requires <fromrev>:<torev>")
-
-        def downgrade(rev, context):
-            return script._downgrade_revs(revision, rev)
-
-        if not sql:
-            # offline mode
-            pass
-        else:
-            with EnvironmentContext(
-                config,
-                script,
-                fn=downgrade,
-                starting_rev=starting_rev,
-                destination_rev=revision,
-                tag=tag,
-            ):
-                script.run_env()
+        with EnvironmentContext(
+            config,
+            script,
+            fn=do_stamp,
+            as_sql=sql,
+            starting_rev=starting_rev if sql else None,
+            destination_rev=util.to_tuple(destination_revs),
+            tag=tag,
+            purge=purge,
+        ):
+            script.run_env()
+            output_buffer.seek(0)
+            return output_buffer.read()
