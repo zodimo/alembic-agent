@@ -5,7 +5,7 @@ from alembic.runtime.environment import EnvironmentContext
 from alembic.script import ScriptDirectory
 from alembic.config import Config
 from alembic import util
-from sqlalchemy import engine_from_config, create_engine
+from sqlalchemy import engine_from_config, create_engine, MetaData
 from sqlalchemy.engine import Engine
 import os, sys
 from contextlib import contextmanager
@@ -16,6 +16,16 @@ class Moonshine:
     __engine = None
     __script_directory = None
     __environment_context = None
+
+    target_metadata = MetaData(
+        naming_convention={
+            "ix": "ix_%(column_0_N_name)s",
+            "uq": "uq_%(table_name)s_%(column_0_N_name)s",
+            "ck": "ck_%(table_name)s_%(constraint_name)s",
+            "fk": "fk_%(table_name)s_%(column_0_N_name)s_%(referred_table_name)s",
+            "pk": "pk_%(table_name)s",
+        }
+    )
 
     def __init__(self, config=None, engine=None, engine_config=None):
         if config is not None:
@@ -118,7 +128,9 @@ class Moonshine:
 
         with self.engine.connect() as connection:
             env.configure(
-                connection=connection, fn=fn,
+                connection=connection,
+                fn=fn,
+                target_metadata=self.target_metadata,
             )
 
             with env.begin_transaction():
