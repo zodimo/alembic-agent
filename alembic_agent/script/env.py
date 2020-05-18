@@ -52,7 +52,6 @@ def run_migrations_online():
             connection=connection,
             target_metadata=target_metadata,
             output_buffer=output_buffer,
-            transactional_ddl=True,
         )
 
         with context.begin_transaction():

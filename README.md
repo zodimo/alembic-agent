@@ -1,9 +1,9 @@
-# moonshine
+# Alembic-Agent
 
 Dynamic implementation of Alembic and SQLAlchemy
 
 ### Create new revision
-run the following from the moonshine lib folder
+run the following from the alembic-agent lib folder
 ```console
 alembic revision -m "create user table"
 ```

@@ -11,7 +11,7 @@ import os, sys, io
 from contextlib import contextmanager
 
 
-class Moonshine:
+class AlembicAgent:
     """
     Only (Online) upgrade, downgrade and stamp use env.py
     Offline removed to return the sql instead of stdout
@@ -152,9 +152,6 @@ class Moonshine:
             starting_rev, revision = revision.split(":", 2)
 
         def do_upgrade(rev, context):
-            logger.debug(
-                f"moonshine:upgrade:do_upgrade:rev:{rev}:revision:{revision}"
-            )
             return script._upgrade_revs(revision, rev)
 
         with EnvironmentContext(
@@ -225,14 +222,10 @@ class Moonshine:
         script = self.script_directory
         return script.get_revisions(revision)
 
-    def history(
-        self, rev_range="base:heads", verbose=False, indicate_current=False
-    ):
+    def history(self, rev_range="base:heads", indicate_current=False):
         """List changeset scripts in chronological order.
 
         :param rev_range: string revision range
-
-        :param verbose: output in verbose mode.
 
         :param indicate_current: indicate current revision.
 
@@ -262,8 +255,8 @@ class Moonshine:
                 base=base or "base", head=head or "heads"
             ):
                 if indicate_current:
-                    sc._db_current_indicator = sc.revision in currents
-                history.append(sc)
+                    sc._db_current_indicator = sc in currents
+                history.insert(0, sc)
 
             return history
 
